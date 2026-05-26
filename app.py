@@ -1,4 +1,4 @@
-import os, uuid, subprocess, threading
+import os, uuid, subprocess, threading, sys
 from pathlib import Path
 from flask import Flask, request, send_file
 from twilio.twiml.messaging_response import MessagingResponse
@@ -13,6 +13,9 @@ BASE_URL            = os.environ.get("BASE_URL", "").rstrip("/")
 OUTPUT_DIR = Path("/tmp/vocal_remover")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+def log(msg):
+    print(msg, flush=True)
+
 def send_whatsapp(to, body, media_url=None):
     client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     kwargs = dict(from_=TWILIO_WHATSAPP_NUM, to=to, body=body)
@@ -21,42 +24,70 @@ def send_whatsapp(to, body, media_url=None):
     client.messages.create(**kwargs)
 
 def remove_vocals(input_path, output_path):
+    # Mono MP3 64kbps - much smaller file for faster upload
     cmd = ["ffmpeg", "-y", "-i", str(input_path),
-           "-af", "pan=stereo|c0=c0-c1|c1=c1-c0",
-           "-ar", "44100", "-ab", "192k", str(output_path)]
+           "-af", "pan=mono|c0=c0-c1",
+           "-ar", "44100", "-ab", "64k",
+           str(output_path)]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg error:\n{result.stderr}")
+        raise RuntimeError(f"ffmpeg error:\n{result.stderr[-500:]}")
 
-def upload_to_public_host(file_path):
-    """Upload to 0x0.st for reliable public hosting that WhatsApp can access."""
-    with open(file_path, 'rb') as f:
-        resp = req.post(
-            'https://0x0.st',
-            files={'file': ('no_vocals.mp3', f, 'audio/mpeg')},
-            timeout=120
+def try_upload(file_path, job_id):
+    """Try filebin.net upload. Returns URL or None."""
+    try:
+        bin_id = job_id[:12]
+        log(f"Uploading to filebin.net, bin={bin_id}")
+        file_bytes = open(file_path, 'rb').read()
+        log(f"File size: {len(file_bytes)} bytes")
+        r = req.post(
+            f'https://filebin.net/{bin_id}/instrumental.mp3',
+            data=file_bytes,
+            headers={'Content-Type': 'audio/mpeg', 'accept': 'application/json'},
+            timeout=60
         )
-    if resp.status_code == 200:
-        return resp.text.strip()
-    raise RuntimeError(f"Upload failed with status {resp.status_code}")
+        log(f"filebin.net response: {r.status_code}")
+        if r.status_code in (200, 201):
+            return f'https://filebin.net/{bin_id}/instrumental.mp3'
+    except Exception as e:
+        log(f"filebin upload error: {e}")
+    return None
 
 def process_job(media_url, from_number, job_id):
     job_dir = OUTPUT_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     input_file  = job_dir / "input.mp3"
-    output_file = job_dir / "no_vocals.mp3"
+    output_file = job_dir / "output.mp3"
     try:
+        log(f"Downloading media from Twilio for job {job_id}")
         resp = req.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=60)
         resp.raise_for_status()
         input_file.write_bytes(resp.content)
+        log(f"Downloaded {len(resp.content)} bytes, running ffmpeg")
         remove_vocals(input_file, output_file)
-        file_url = upload_to_public_host(output_file)
-        send_whatsapp(from_number, "Done! Here is your vocal-removed track:", media_url=file_url)
+        log("ffmpeg done, attempting upload")
+
+        public_url = try_upload(output_file, job_id)
+
+        if public_url:
+            log(f"Upload succeeded: {public_url}")
+            try:
+                send_whatsapp(from_number, "Done! Here is your vocal-removed track:", media_url=public_url)
+                log("WhatsApp media message sent")
+            except Exception as e:
+                log(f"Media send failed ({e}), sending link instead")
+                send_whatsapp(from_number, f"Done! Tap to download your vocal-removed track:\n{public_url}")
+        else:
+            # Fall back: serve from our own URL and send as a download link
+            log("Upload failed, using Railway URL as download link")
+            dl_url = f"{BASE_URL}/audio/{job_id}/output.mp3"
+            send_whatsapp(from_number, f"Done! Tap the link below to download your vocal-removed track (works in browser):\n{dl_url}")
+
     except Exception as exc:
+        log(f"process_job error: {exc}")
         send_whatsapp(from_number, f"Sorry, something went wrong: {exc}\n\nPlease try again or send the file in MP3 format.")
     finally:
         if input_file.exists(): input_file.unlink()
-        if output_file.exists(): output_file.unlink()
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -66,14 +97,14 @@ def webhook():
     resp = MessagingResponse()
     if num_media == 0:
         if body in ("hi", "hello", "hey", "start", "help"):
-            resp.message("Hi! I am your Vocal Remover Bot.\n\nSimply send me an audio file (MP3, OGG, M4A) and I will strip the vocals and send back the instrumental version - usually within 1-2 minutes!")
+            resp.message("Hi! I am your Vocal Remover Bot.\n\nSend me any audio file (MP3, OGG, M4A, WAV) and I will strip the vocals and send back the instrumental!")
         else:
-            resp.message("Send me an audio file and I will remove the vocals for you!\n\nSupported formats: MP3, OGG, M4A, WAV")
+            resp.message("Send me an audio file and I will remove the vocals!\n\nSupported: MP3, OGG, M4A, WAV")
         return str(resp)
     media_url = request.values.get("MediaUrl0")
     job_id = str(uuid.uuid4())
     threading.Thread(target=process_job, args=(media_url, from_number, job_id), daemon=True).start()
-    resp.message("Got it! Removing vocals now...\nThis usually takes 1-2 minutes. I will send the result straight back to you!")
+    resp.message("Got it! Removing vocals now...\nThis usually takes 1-2 minutes. I will send the result straight back!")
     return str(resp)
 
 @app.route("/audio/<job_id>/<filename>")
